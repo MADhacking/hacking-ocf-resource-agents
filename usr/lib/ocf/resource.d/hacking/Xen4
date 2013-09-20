@@ -1,0 +1,388 @@
+#! /bin/bash
+#
+# Copyright:	2013
+# Author:		Max Hacking - Hacking Networked Solutions
+# License:      GNU General Public License (GPL) v3+
+#
+#	Resource Agent for the Xen Hypervisor
+#
+#	Manages Xen virtual machine instances by
+#	mapping cluster resource start, stop, migrate_to 
+#	and migrate_from to Xen xl commands.
+#
+#	usage: $0 {start|stop|status|migrate_to|migrate_from|monitor|meta-data}
+#
+#	  OCF parameters are as below:
+#		OCF_RESKEY_xmfile
+#			Absolute path to the Xen control file for
+#			this virtual machine
+#		OCF_RESKEY_monitor_scripts
+#			scripts to monitor services within the
+#			virtual domain
+#		OCF_RESKEY_shutdown_timeout
+#			timeout before forcibly destroying domain
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+: ${OCF_RESKEY_xmfile=/etc/xen/vm/MyDomU}
+
+#######################################################################
+
+# Declare OCF RA usage and meta-data functions.
+
+OCFRA_Usage()
+{
+	echo "usage: $0 {status|start|stop|monitor|meta-data|validate-all}"
+}
+
+OCFRA_Meta_Data()
+{
+	cat /usr/lib/ocf/resource.d/hacking/Xen4.xml
+}
+
+#######################################################################
+# Declare internal functions
+
+# Description:
+#	Stops the domain specified in $1, first using "xl shutdown" then,
+#	after a (configurable) timeout, using "xl destroy".
+#
+# Parameters:
+#
+#	$1	- the name of the domain we wish to stop
+
+xen_domain_stop()
+{
+	local dom=$1
+	local timeout
+
+	# If we have had a timeout specified then use that.  If not
+	# use 2/3 of the action timeout for the orderly shutdown. If
+	# we've still not found a timeout value use 60 seconds.
+	if [ -n "$OCF_RESKEY_shutdown_timeout" ]; then
+		timeout=$OCF_RESKEY_shutdown_timeout
+	elif [ -n "$OCF_RESKEY_CRM_meta_timeout" ]; then
+		# (The origin unit is ms, hence the conversion)
+		timeout=$((OCF_RESKEY_CRM_meta_timeout/1500))
+	else
+		timeout=60
+	fi
+
+	# If the timeout is greater than 0 (if it 0 we will use xl
+	# destroy) then try to shut down the domain gracefully.
+	if [ "$timeout" -gt 0 ]; then
+		ocf_log info "Xen domain $dom will be stopped (timeout: ${timeout}s)"
+
+		xl shutdown $dom
+          
+		while Xen_Status $dom && [ "$timeout" -gt 0 ]; do
+			sleep 1
+			timeout=$((timeout-1))
+			ocf_log debug "$dom still not stopped. Waiting...${timeout}..."
+		done
+    fi
+
+    # If the timeout got to zero then we need to use xl destroy.
+	# Note: This does not give up as stop isn't allowed to to fail.
+	# If xl destroy fails, stop will eventually timeout.
+	# This is the correct behaviour.
+	if [ "$timeout" -eq 0 ]; then
+		while Xen_Status $dom; do
+			ocf_log warn "Xen domain $dom will be destroyed!"
+			xl destroy $dom
+			sleep 1
+		done
+	fi
+
+	# We got this far so we must have stopped the domain by now!
+	ocf_log info "Xen domain $dom stopped."
+}
+
+# Description:
+#	Reads the configuration file specified by ${OCF_RESKEY_xmfile} and
+#	attempts to call xl pci-attach ${DOMAIN_NAME} for each listed PCI
+#	device.
+#
+# Returns:
+# 	 0 - everything worked ok
+#	>0 - something went wrong
+
+xen_attach_pci_devices()
+{
+	echo $(<${OCF_RESKEY_xmfile}) | \
+		sed -n 's/^.*pci[[:space:]]*=[[:space:]]*\[[[:space:]]*\(.*\)\].*/\1/p' | \
+		awk 'BEGIN{FS=OFS="\""} {for (i=1;i<=NF;i+=2) gsub(/,/,"\n",$i)}1' | \
+		xargs -l1 xl pci-attach ${DOMAIN_NAME}
+
+	return $?
+}
+
+#######################################################################
+# Declare actions
+
+# Description:
+#	Queries the state of the specified domain.
+#
+# Parameters:
+#
+#	$1	- the name of the domain we wish to query
+#
+# Returns:
+# 	$OCF_NOT_RUNNING - the domain is not running
+#	$OCF_SUCCESS	 - the domain is running
+
+Xen_Status()
+{
+	`xl list $1 &>/dev/null`
+	if [ $? -ne 0 ]; then
+      	return $OCF_NOT_RUNNING
+    else
+      	return $OCF_SUCCESS
+	fi
+}
+
+# Description:
+#	Starts the domain specified in ${OCF_RESKEY_xmfile}
+#	unless it is already running.
+#
+# Returns:
+#	$OCF_SUCCESS	 - the domain started correctly or is already running
+
+Xen_Start()
+{
+	if Xen_Status ${DOMAIN_NAME}; then
+    	ocf_log info "Xen domain $DOMAIN_NAME already running."
+		return $OCF_SUCCESS
+	fi
+
+	xl create ${OCF_RESKEY_xmfile} --quiet || return $OCF_ERR_GENERIC
+	
+	while sleep 1; do
+		Xen_Monitor && return $OCF_SUCCESS
+	done
+}
+
+# Description:
+#	Stops the domain specified in ${DOMAIN_NAME}
+#	unless it is not running.
+#
+# Returns:
+#	$OCF_SUCCESS	 - the domain stopped correctly or was not running
+
+Xen_Stop()
+{
+	local vm
+	if Xen_Status ${DOMAIN_NAME}; then
+		vm=${DOMAIN_NAME}
+	elif Xen_Status migrating-${DOMAIN_NAME}; then
+		ocf_log info "Xen domain $DOMAIN_NAME is migrating" 
+		vm="migrating-${DOMAIN_NAME}"
+	else
+		ocf_log info "Xen domain $DOMAIN_NAME already stopped." 
+	fi
+
+	if [ "$vm" ]; then
+		xen_domain_stop $vm
+	else
+		# It is supposed to be gone, but there have been situations where xl
+		# list / xen-list showed it as stopped but it was still instantiated.
+		# Nuke it once more to make sure:
+		$xenkill ${DOMAIN_NAME}
+	fi
+
+	return $OCF_SUCCESS
+}
+
+# Description:
+#	Migrates the domain specified in ${DOMAIN_NAME} to the target host
+#	specified in ${OCF_RESKEY_CRM_meta_migrate_target}.  Any virtual PCI
+#	devices will be detached before migration (and possibly re-attached
+#	in Xen_Migrate_From).
+#
+# Returns:
+#	$OCF_SUCCESS	 - the domain migrated correctly
+#	$OCF_ERR_GENERIC - the domain was either not running or migration failed
+
+Xen_Migrate_To()
+{
+	# If the domain isn't running locally then we're done!
+	if ! Xen_Status ${DOMAIN_NAME}; then
+    	ocf_log err "${DOMAIN_NAME}: migrate_to: Not active locally!"
+		return $OCF_ERR_GENERIC
+	fi
+
+	local target_host="${OCF_RESKEY_CRM_meta_migrate_target}"
+	ocf_log info "${DOMAIN_NAME}: Starting xl migrate to ${target_host}"
+		
+	# Try to get the xen_back_net_ip (if there is one) for the
+	# target host.  If we don't get anything then set it to the
+	# value of the target_host.
+	local target_addr=`crm_attribute --node ${target_host} --name xen_back_net_ip --query --quiet`
+	if [ -z "${target_addr}" ]; then
+		ocf_log info "Using default address for ${target_host}"
+		target_addr="${target_host}"
+	else
+		ocf_log info "Using address ${target_addr} for ${target_host}"
+	fi
+	
+	# Before we can migrate a domain we need to detach any PCI devices.
+	xl pci-list ${DOMAIN_NAME} | grep -v -e "Device" | awk '{ print $2 }' | \
+		 xargs -L1 -r xl pci-detach ${DOMAIN_NAME}  
+	
+	# Try to migrate the domain.  If it didn't work then we need to 
+	# log an error and bail.
+	xl migrate ${DOMAIN_NAME} ${target_addr}
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		ocf_log err "$DOMAIN_NAME: xl migrate to $target_node failed: $rc"
+		return $OCF_ERR_GENERIC
+	fi
+	
+	# If we got all the way here it worked!
+	ocf_log info "$DOMAIN_NAME: xl migrate to $target_node succeeded."
+	return $OCF_SUCCESS
+}
+
+# Description:
+#	Checks if the migration of the domain specified in ${DOMAIN_NAME} has
+#	been a success.
+#
+# Returns:
+#	$OCF_SUCCESS	 - the domain is running
+#	$OCF_ERR_GENERIC - the domain is NOT running
+
+Xen_Migrate_From()
+{
+	# If the domain is running we can try to re-attach any virtual PCI
+	# devices.  If it works we can signal success, if it doesn't we
+	# need to signal failure.  If the domain is not active failure will
+	# be signalled at function end.
+	if Xen_Status ${DOMAIN_NAME}; then
+		ocf_log info "$DOMAIN_NAME: Active locally, migration successful"
+		
+		xen_attach_pci_devices && return $OCF_SUCCESS
+		
+		ocf_log err "$DOMAIN_NAME: Attaching PCI devices to domain failed!"
+		return $OCF_ERR_GENERIC
+	fi
+	
+	# If we got this far then we have a problem, log it and indicate failure.
+	ocf_log err "$DOMAIN_NAME: Not active locally, migration failed!"
+	return $OCF_ERR_GENERIC
+}
+
+# Description:
+#	Monitors the status off the domain specified in ${DOMAIN_NAME}.  If any
+#	additional monitor scripts are specified then they will be tested too.
+#
+# Returns:
+#	$OCF_SUCCESS	 - the domain is running (and any monitor scripts returned OK)
+#	$OCF_ERR_GENERIC - the domain is NOT running (or some monitors scripts returned ERR)
+
+Xen_Monitor()
+{
+	# If the domain is not running then we're done and we can
+	# signal that right now.
+	if ! Xen_Status ${DOMAIN_NAME}; then
+		return ${OCF_NOT_RUNNING}
+	fi
+	
+	# If we got this far and there are no monitor scripts then we can
+	# indicate all OK.
+	if [ "X${OCF_RESKEY_monitor_scripts}" = "X" ]; then
+		return ${OCF_SUCCESS}
+	fi
+	
+	# There must be some scripts so try them and indicate ERR if any of
+	# them fail.
+	for SCRIPT in ${OCF_RESKEY_monitor_scripts}; do
+		$SCRIPT
+		if [ $? -ne 0 ]; then
+			return ${OCF_ERR_GENERIC}
+		fi
+  	done
+  	
+  	# If we got all the way to the end everything is OK!
+	return ${OCF_SUCCESS}
+}
+
+#######################################################################
+# Main entry point:
+
+# Check that we have the correct number of arguments.
+if [ $# -ne 1 ]; then
+	usage
+	exit $OCF_ERR_ARGS
+fi
+
+# If this is just a request for usage instructions or meta-data then we
+# can handle it without wasting any more time.
+case $1 in
+	usage)
+		OCFRA_Usage
+		exit $OCF_SUCCESS
+		;;
+	meta-data)
+		OCFRA_Meta_Data
+		exit $OCF_SUCCESS
+		;;
+esac
+
+# If we have got this far then we may need some tools so check they exist.
+for binary in xl; do
+    check_binary $binary
+done
+
+# We need to work out the name of the domain.  We assume that it is the
+# file-name portion of the Xen configuration file - of course this means
+# that if we can't find the configuration file we have a problem and need
+# to bail already!
+if [ ! -f "${OCF_RESKEY_xmfile}" ]; then
+	ocf_log err "Unable to locate Xen domain configuration file [${OCF_RESKEY_xmfile}]"
+	exit $OCF_ERR_CONFIGURED
+fi
+DOMAIN_NAME="${OCF_RESKEY_xmfile##*/}"
+
+# Check that our parameters are valid.
+if [ -n "${OCF_RESKEY_shutdown_timeout}" ]; then
+	if ! ocf_is_decimal ${OCF_RESKEY_shutdown_timeout}; then
+		ocf_log err "shutdown_timeout must be a number (and is \"${OCF_RESKEY_shutdown_timeout}\")"
+		exit $OCF_ERR_CONFIGURED
+	fi
+fi
+
+# Assuming everything worked out so far we can try to interpret the
+# action (in $1) and do something.
+case $1 in
+	status)
+		Xen_Status ${DOMAIN_NAME}
+		;;
+	start)
+		Xen_Start
+		;;
+	stop)
+		Xen_Stop
+		;;
+	migrate_to)
+		Xen_Migrate_To
+		;;
+	migrate_from)
+		Xen_Migrate_From
+		;;
+	monitor)
+		Xen_Monitor
+		;;
+	validate-all)
+		return $OCF_SUCCESS
+		;;
+	*)
+		usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+
+exit $?

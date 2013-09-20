@@ -1,0 +1,121 @@
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="Xen">
+	<version>1.0</version>
+
+	<longdesc lang="en">
+		Resource Agent for the Xen Hypervisor.
+		Manages Xen virtual machine instances by mapping cluster resource
+		start and stop, to Xen create and shutdown, respectively.
+
+		A note on names
+
+		We will try to extract the name from the config file (the xmfile
+		attribute). If you use a simple assignment statement, then you
+		should be fine. Otherwise, if there's some python acrobacy
+		involved such as dynamically assigning names depending on other
+		variables, and we will try to detect this, then please set the
+		name attribute. You should also do that if there is any chance of
+		a pathological situation where a config file might be missing,
+		for example if it resides on a shared storage. If all fails, we
+		finally fall back to the instance id to preserve backward
+		compatibility.
+
+		Para-virtualized guests can also be migrated by enabling the
+		meta_attribute allow-migrate.
+
+	</longdesc>
+	<shortdesc lang="en">Manages Xen unprivileged domains (DomUs)</shortdesc>
+
+	<parameters>
+
+		<parameter name="xmfile" unique="0" required="1">
+			<longdesc lang="en">
+				Absolute path to the Xen control file,
+				for this virtual machine.
+			</longdesc>
+			<shortdesc lang="en">Xen control file</shortdesc>
+			<content type="string" default="" />
+		</parameter>
+		<parameter name="name" unique="0" required="0">
+			<longdesc lang="en">
+				Name of the virtual machine.
+			</longdesc>
+			<shortdesc lang="en">Xen DomU name</shortdesc>
+			<content type="string" default="" />
+		</parameter>
+		<parameter name="shutdown_timeout">
+			<longdesc lang="en">
+				The Xen agent will first try an orderly shutdown using xm shutdown.
+				Should this not succeed within this timeout, the agent will escalate
+				to
+				xm destroy, forcibly killing the node.
+
+				If this is not set, it will default to two-third of the stop action
+				timeout.
+
+				Setting this value to 0 forces an immediate destroy.
+
+			</longdesc>
+			<shortdesc lang="en">Shutdown escalation timeout</shortdesc>
+			<content type="string" default="" />
+		</parameter>
+		<parameter name="allow_mem_management" unique="0" required="0">
+			<longdesc lang="en">
+				This parameter enables dynamic adjustment of memory for start
+				and stop actions used for Dom0 and the DomUs. The default is
+				to not adjust memory dynamically.
+			</longdesc>
+			<shortdesc lang="en">Use dynamic memory management</shortdesc>
+			<content type="boolean" default="0" />
+		</parameter>
+
+		<parameter name="node_ip_attribute">
+			<longdesc lang="en">
+				In case of a live migration, the system will default to using the IP
+				address associated with the hostname via DNS or /etc/hosts.
+
+				This parameter allows you to specify a node attribute that will be
+				queried instead for the target node, overriding the IP address. This
+				allows you to use a dedicated network for live migration traffic to
+				a
+				specific node.
+
+				Warning: make very sure the IP address does point to the right node. Or
+				else the live migration will end up somewhere else, greatly confusing
+				the cluster and causing havoc.
+			</longdesc>
+			<shortdesc lang="en">Node attribute containing target IP address</shortdesc>
+			<content type="string" default="" />
+		</parameter>
+
+		<parameter name="reserved_Dom0_memory" unique="0" required="0">
+			<longdesc lang="en">
+				In case memory management is used, this parameter
+				defines the minimum amount of memory to be reserved
+				for the dom0. The default minimum memory is 512MB.
+			</longdesc>
+			<shortdesc lang="en">Minimum Dom0 memory</shortdesc>
+			<content type="string" default="512" />
+		</parameter>
+		<parameter name="monitor_scripts" unique="0" required="0">
+			<longdesc lang="en">
+				To additionally monitor services within the unprivileged domain,
+				add this parameter with a list of scripts to monitor.
+			</longdesc>
+			<shortdesc lang="en">list of space separated monitor scripts</shortdesc>
+			<content type="string" default="" />
+		</parameter>
+
+	</parameters>
+
+	<actions>
+		<action name="start" timeout="60" />
+		<action name="stop" timeout="40" />
+		<action name="migrate_from" timeout="120" />
+		<action name="migrate_to" timeout="120" />
+		<action name="monitor" depth="0" timeout="30" interval="10" />
+		<action name="meta-data" timeout="5" />
+		<action name="validate-all" timeout="5" />
+	</actions>
+</resource-agent>
